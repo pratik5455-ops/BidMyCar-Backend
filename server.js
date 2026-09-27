@@ -1,7 +1,9 @@
 const express = require("express");
 const cors = require("cors");
 const db = require("./config/db");
-
+const {
+    startAuctionSettlementWorker
+} = require("./services/auctionSettlementService");
 const authRoutes = require("./routes/auth");
 const vehicleRoutes = require("./routes/vehicles");
 const auctionRoutes = require("./routes/auctions");
@@ -107,9 +109,7 @@ app.get("/api/db-test", async (req, res) => {
 // ===============================
 
 app.listen(PORT, () => {
+    console.log("Server started successfully");
 
-    console.log(
-        `Bid My Car backend running on http://localhost:${PORT}`
-    );
-
+    startAuctionSettlementWorker();
 });

@@ -198,13 +198,11 @@ router.delete("/:id/watchlist", authenticateToken, async (req, res) => {
     try {
         const vehicleId = req.params.id;
         const userId = req.user.userId;
-
         const [result] = await db.query(
             `DELETE FROM watchlists
              WHERE user_id = ? AND vehicle_id = ?`,
             [userId, vehicleId]
         );
-
         if (result.affectedRows === 0) {
             return res.status(404).json({
                 success: false,

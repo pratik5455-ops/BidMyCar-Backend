@@ -11,30 +11,52 @@ const router = express.Router();
 
 const updateAuctionStatus = async (connection, auction) => {
     const now = new Date();
+
     const startTime = new Date(auction.start_time);
 
-    // Use the dynamically extended end time when available.
-    // Fall back to end_time for older auctions.
     const endTime = new Date(
         auction.current_end_time || auction.end_time
     );
 
+    // Safety check
+    if (
+        Number.isNaN(startTime.getTime()) ||
+        Number.isNaN(endTime.getTime())
+    ) {
+        throw new Error(
+            `Invalid auction dates for auction ${auction.id}`
+        );
+    }
+
     let newStatus;
 
+    // Auction has not started
     if (now < startTime) {
         newStatus = "upcoming";
-    } else if (now >= startTime && now < endTime) {
+    }
+
+    // Auction is currently running
+    else if (now < endTime) {
         newStatus = "active";
-    } else {
+    }
+
+    // Auction has ended
+    else {
         newStatus = "ended";
     }
 
+    // Only update database when status actually changed
     if (auction.status !== newStatus) {
         await connection.query(
-            `UPDATE auctions
-             SET status = ?
-             WHERE id = ?`,
-            [newStatus, auction.id]
+            `
+            UPDATE auctions
+            SET status = ?
+            WHERE id = ?
+            `,
+            [
+                newStatus,
+                auction.id
+            ]
         );
 
         auction.status = newStatus;
@@ -43,130 +65,534 @@ const updateAuctionStatus = async (connection, auction) => {
     return auction;
 };
 // =====================================================
-// FINALIZE AUCTION
+// FINALIZE AUCTION + SETTLE PAYMENT
 // =====================================================
-
 const finalizeAuction = async (connection, auction) => {
+
     const now = new Date();
 
-    // Use the dynamically extended end time when available.
-    // Fall back to end_time for older auctions.
+    // -------------------------------------------------
+    // 1. DETERMINE ACTUAL END TIME
+    // -------------------------------------------------
+
     const endTime = new Date(
         auction.current_end_time || auction.end_time
     );
 
+    if (Number.isNaN(endTime.getTime())) {
+        throw new Error("Invalid auction end time");
+    }
+
     // Auction has not ended yet
     if (now < endTime) {
+
         return {
             finalized: false,
+            settled: false,
             winner: null
         };
     }
 
-    // Already finalized
-    if (auction.status === "ended") {
+    // -------------------------------------------------
+    // 2. MAKE SURE AUCTION IS ENDED
+    // -------------------------------------------------
+
+    if (auction.status !== "ended") {
+
+        await connection.query(
+            `UPDATE auctions
+             SET status = 'ended'
+             WHERE id = ?`,
+            [auction.id]
+        );
+
+        auction.status = "ended";
+    }
+
+    // -------------------------------------------------
+    // 3. ALREADY COMPLETED
+    // -------------------------------------------------
+
+    if (auction.settlement_status === "completed") {
+
         return {
             finalized: true,
+            settled: true,
+
             winner:
-                auction.reserve_met && auction.high_bidder_id
+                auction.reserve_met &&
+                auction.high_bidder_id
                     ? {
-                        bidder_id: auction.high_bidder_id,
-                        bidder_name: auction.high_bidder
+                        bidder_id: Number(
+                            auction.high_bidder_id
+                        ),
+                        bidder_name:
+                            auction.high_bidder
                     }
                     : null
         };
     }
 
-    // Mark auction as ended
-    await connection.query(
-        `UPDATE auctions
-         SET status = 'ended'
-         WHERE id = ?`,
-        [auction.id]
-    );
+    // -------------------------------------------------
+    // 4. ALREADY MARKED AS NO WINNER
+    // -------------------------------------------------
 
-    auction.status = "ended";
+    if (auction.settlement_status === "no_winner") {
 
-    // Reserve price was not met or there was no bidder
-    if (!auction.reserve_met || !auction.high_bidder_id) {
         return {
             finalized: true,
+            settled: true,
             winner: null
         };
     }
 
-    // Reserve price was met and a highest bidder exists
+    // -------------------------------------------------
+    // 5. VALIDATE WINNER
+    // -------------------------------------------------
+
+    const reserveMet =
+        Number(auction.reserve_met) === 1;
+
+    const highBidderId =
+        auction.high_bidder_id
+            ? Number(auction.high_bidder_id)
+            : null;
+
+    // No valid winner
+    if (!reserveMet || !highBidderId) {
+
+        await connection.query(
+            `UPDATE auctions
+             SET
+                settlement_status = 'no_winner',
+                settled_at = NOW(),
+                settlement_reference = ?
+             WHERE id = ?
+               AND settlement_status = 'pending'`,
+            [
+                `NO_WINNER-${auction.id}`,
+                auction.id
+            ]
+        );
+
+        auction.settlement_status = "no_winner";
+        auction.settled_at = new Date();
+        auction.settlement_reference =
+            `NO_WINNER-${auction.id}`;
+
+        return {
+            finalized: true,
+            settled: true,
+            winner: null
+        };
+    }
+
+    // -------------------------------------------------
+    // 6. VALIDATE SELLER
+    // -------------------------------------------------
+
+    const sellerId = Number(auction.seller_id);
+
+    if (!Number.isInteger(sellerId)) {
+
+        throw new Error(
+            "Invalid seller ID for auction settlement"
+        );
+    }
+
+    // -------------------------------------------------
+    // 7. VALIDATE FINAL PRICE
+    // -------------------------------------------------
+
+    const finalPrice =
+        Number(auction.current_bid);
+
+    if (
+        !Number.isFinite(finalPrice) ||
+        finalPrice <= 0
+    ) {
+
+        throw new Error(
+            "Invalid final auction price"
+        );
+    }
+
+    // -------------------------------------------------
+    // 8. CHECK EXISTING PURCHASE
+    // -------------------------------------------------
+
+    const [existingPurchases] =
+        await connection.query(
+            `SELECT
+                id,
+                buyer_id,
+                purchase_price,
+                status
+             FROM vehicle_purchases
+             WHERE vehicle_id = ?
+             LIMIT 1
+             FOR UPDATE`,
+            [auction.vehicle_id]
+        );
+
+    if (existingPurchases.length > 0) {
+
+        const existingPurchase =
+            existingPurchases[0];
+
+        // Existing purchase belongs to this winner
+        if (
+            Number(existingPurchase.buyer_id) ===
+            highBidderId
+        ) {
+
+            const reference =
+                `SETTLED-${auction.id}`;
+
+            await connection.query(
+                `UPDATE auctions
+                 SET
+                    settlement_status = 'completed',
+                    settled_at = COALESCE(
+                        settled_at,
+                        NOW()
+                    ),
+                    settlement_reference = COALESCE(
+                        settlement_reference,
+                        ?
+                    )
+                 WHERE id = ?`,
+                [
+                    reference,
+                    auction.id
+                ]
+            );
+
+            auction.settlement_status =
+                "completed";
+
+            auction.settlement_reference =
+                reference;
+
+            return {
+                finalized: true,
+                settled: true,
+
+                winner: {
+                    bidder_id: highBidderId,
+                    bidder_name:
+                        auction.high_bidder
+                }
+            };
+        }
+
+        // Vehicle is already owned by someone else
+        throw new Error(
+            "Vehicle has already been purchased by another buyer"
+        );
+    }
+
+    // -------------------------------------------------
+    // 9. LOCK BUYER + SELLER
+    // -------------------------------------------------
+
+    const [users] =
+        await connection.query(
+            `SELECT
+                id,
+                wallet_balance
+             FROM users
+             WHERE id IN (?, ?)
+             ORDER BY id
+             FOR UPDATE`,
+            [
+                highBidderId,
+                sellerId
+            ]
+        );
+
+    const winner =
+        users.find(
+            user =>
+                Number(user.id) ===
+                highBidderId
+        );
+
+    const seller =
+        users.find(
+            user =>
+                Number(user.id) ===
+                sellerId
+        );
+
+    if (!winner) {
+
+        throw new Error(
+            "Auction winner account not found"
+        );
+    }
+
+    if (!seller) {
+
+        throw new Error(
+            "Vehicle seller account not found"
+        );
+    }
+
+    // -------------------------------------------------
+    // 10. CHECK BUYER BALANCE
+    // -------------------------------------------------
+
+    const winnerBalance =
+        Number(winner.wallet_balance);
+
+    if (
+    !Number.isFinite(winnerBalance) ||
+    winnerBalance < finalPrice
+) {
+
+    const paymentDeadline =
+        await createPaymentDeadline(
+            connection,
+            auction
+        );
+
     return {
         finalized: true,
+        settled: false,
+
         winner: {
-            bidder_id: auction.high_bidder_id,
-            bidder_name: auction.high_bidder
+            bidder_id: highBidderId,
+            bidder_name:
+                auction.high_bidder
+        },
+
+        payment_required: true,
+        payment_failed: true,
+
+        payment_deadline:
+            paymentDeadline,
+
+        message:
+            "Auction winner does not have sufficient wallet balance"
+    };
+}
+    // -------------------------------------------------
+    // 11. CREATE UNIQUE SETTLEMENT REFERENCE
+    // -------------------------------------------------
+
+    const settlementReference =
+        `SETTLEMENT-${auction.id}`;
+
+    // -------------------------------------------------
+    // 12. MARK PROCESSING
+    // -------------------------------------------------
+
+    await connection.query(
+        `UPDATE auctions
+         SET settlement_status = 'processing'
+         WHERE id = ?
+           AND settlement_status = 'pending'`,
+        [auction.id]
+    );
+
+    // -------------------------------------------------
+    // 13. DEBIT WINNER
+    // -------------------------------------------------
+
+    const [debitResult] =
+        await connection.query(
+            `UPDATE users
+             SET wallet_balance =
+                 wallet_balance - ?
+             WHERE id = ?
+               AND wallet_balance >= ?`,
+            [
+                finalPrice,
+                highBidderId,
+                finalPrice
+            ]
+        );
+
+    if (debitResult.affectedRows !== 1) {
+
+        throw new Error(
+            "Winner wallet debit failed"
+        );
+    }
+
+    // -------------------------------------------------
+    // 14. RECORD BUYER DEBIT
+    // -------------------------------------------------
+
+    await connection.query(
+        `INSERT INTO wallet_transactions
+        (
+            user_id,
+            type,
+            amount,
+            description,
+            reference_id
+        )
+        VALUES (?, 'debit', ?, ?, ?)`,
+        [
+            highBidderId,
+            finalPrice,
+            `Payment for vehicle ${auction.vehicle_id}`,
+            settlementReference
+        ]
+    );
+
+    // -------------------------------------------------
+    // 15. CREDIT SELLER
+    // -------------------------------------------------
+
+    await connection.query(
+        `UPDATE users
+         SET wallet_balance =
+             wallet_balance + ?
+         WHERE id = ?`,
+        [
+            finalPrice,
+            sellerId
+        ]
+    );
+
+    // -------------------------------------------------
+    // 16. RECORD SELLER CREDIT
+    // -------------------------------------------------
+
+    await connection.query(
+        `INSERT INTO wallet_transactions
+        (
+            user_id,
+            type,
+            amount,
+            description,
+            reference_id
+        )
+        VALUES (?, 'credit', ?, ?, ?)`,
+        [
+            sellerId,
+            finalPrice,
+            `Payment received for vehicle ${auction.vehicle_id}`,
+            settlementReference
+        ]
+    );
+
+    // -------------------------------------------------
+    // 17. CREATE VEHICLE PURCHASE
+    // -------------------------------------------------
+
+    await connection.query(
+        `INSERT INTO vehicle_purchases
+        (
+            vehicle_id,
+            buyer_id,
+            purchase_price,
+            status
+        )
+        VALUES (?, ?, ?, 'completed')`,
+        [
+            auction.vehicle_id,
+            highBidderId,
+            finalPrice
+        ]
+    );
+
+    // -------------------------------------------------
+    // 18. COMPLETE AUCTION SETTLEMENT
+    // -------------------------------------------------
+
+    await connection.query(
+        `UPDATE auctions
+         SET
+            settlement_status = 'completed',
+            settled_at = NOW(),
+            settlement_reference = ?
+         WHERE id = ?`,
+        [
+            settlementReference,
+            auction.id
+        ]
+    );
+
+    // Keep in-memory object synchronized
+    auction.settlement_status =
+        "completed";
+
+    auction.settled_at =
+        new Date();
+
+    auction.settlement_reference =
+        settlementReference;
+
+    // -------------------------------------------------
+    // 19. RETURN SUCCESS
+    // -------------------------------------------------
+
+    return {
+        finalized: true,
+        settled: true,
+
+        winner: {
+            bidder_id: highBidderId,
+            bidder_name:
+                auction.high_bidder
+        },
+
+        payment: {
+            amount: finalPrice,
+            status: "completed",
+            reference:
+                settlementReference
         }
     };
 };
-const formatAuctionResponse = (auction) => { 
-const formattedAuction = { ...auction }; 
-   if (formattedAuction.status === "ended") {
-     formattedAuction.final_bid = formattedAuction.current_bid;
-      delete formattedAuction.current_bid;
-       delete formattedAuction.vehicle_current_bid; 
-    } else if (formattedAuction.status === "active") { 
-        formattedAuction.current_bid = formattedAuction.current_bid || 0; 
-        delete formattedAuction.final_bid; 
-        delete formattedAuction.vehicle_current_bid;
-     } else {
-         delete formattedAuction.current_bid; 
-         delete formattedAuction.final_bid;
-          delete formattedAuction.vehicle_current_bid;
-    }
-     return formattedAuction;
-};
 // =====================================================
-// GET ALL AUCTIONS
+// PAYMENT WINDOW
 // =====================================================
 
-router.get("/", async (req, res) => {
-    try {
-        const [auctions] = await db.query(
-            `SELECT
-                a.*,
-                v.title AS vehicle_title,
-                v.make,
-                v.model,
-                v.year,
-                v.category,
-                v.primary_damage,
-                v.current_bid AS vehicle_current_bid,
-                v.seller_id
-             FROM auctions a
-             INNER JOIN vehicles v
-                ON a.vehicle_id = v.id
-             ORDER BY a.start_time ASC`
+const PAYMENT_WINDOW_MINUTES = 30;
+
+
+// -----------------------------------------------------
+// CREATE PAYMENT DEADLINE
+// -----------------------------------------------------
+
+const createPaymentDeadline = async (
+    connection,
+    auction
+) => {
+
+    // Already has a payment deadline
+    if (auction.payment_deadline) {
+
+        return new Date(
+            auction.payment_deadline
         );
-
-        // Update status of each auction according to its time
-        for (const auction of auctions) {
-            await updateAuctionStatus(db, auction);
-        }
-
-        // Format auction data according to its current lifecycle state
-        const formattedAuctions = auctions.map(formatAuctionResponse);
-
-        res.status(200).json({
-            success: true,
-            count: formattedAuctions.length,
-            auctions: formattedAuctions
-        });
-
-    } catch (error) {
-        console.error("Get all auctions error:", error);
-
-        res.status(500).json({
-            success: false,
-            message: "Failed to fetch auctions"
-        });
     }
-});
+
+    const deadline = new Date(
+        Date.now() +
+        PAYMENT_WINDOW_MINUTES * 60 * 1000
+    );
+
+    await connection.query(
+        `UPDATE auctions
+         SET payment_deadline = ?
+         WHERE id = ?
+           AND settlement_status = 'pending'`,
+        [
+            deadline,
+            auction.id
+        ]
+    );
+
+    auction.payment_deadline = deadline;
+
+    return deadline;
+};
 // =====================================================
 // GET MY BIDS
 // =====================================================
@@ -184,6 +610,8 @@ router.get("/my-bids", authenticateToken, async (req, res) => {
 
                 a.start_time,
                 a.end_time,
+                a.scheduled_end_time,
+                a.current_end_time,
                 a.starting_bid,
                 a.current_bid,
                 a.reserve_price,
@@ -192,13 +620,15 @@ router.get("/my-bids", authenticateToken, async (req, res) => {
                 a.status,
                 a.high_bidder,
                 a.high_bidder_id,
+                a.settlement_status,
 
                 v.title AS vehicle_title,
                 v.make,
                 v.model,
                 v.year,
                 v.category,
-                v.primary_damage
+                v.primary_damage,
+                v.seller_id
 
              FROM bids b
 
@@ -214,18 +644,73 @@ router.get("/my-bids", authenticateToken, async (req, res) => {
             [bidderId]
         );
 
-        // Update auction status and finalize auctions whose
-        // end time has already passed.
-        const processedAuctions = new Set();
+        
+        // =====================================================
+       // UPDATE / FINALIZE UNIQUE AUCTIONS
+      // =====================================================
 
-        for (const bid of bids) {
-            if (!processedAuctions.has(bid.auction_id)) {
-                await updateAuctionStatus(db, bid);
-                await finalizeAuction(db, bid);
+const processedAuctions = new Set();
 
-                processedAuctions.add(bid.auction_id);
-            }
-        }
+for (const bid of bids) {
+
+    const auctionId = Number(
+        bid.auction_id
+    );
+
+    // Prevent processing the same auction
+    // multiple times when the user placed
+    // multiple bids on it.
+    if (
+        processedAuctions.has(auctionId)
+    ) {
+        continue;
+    }
+
+    processedAuctions.add(auctionId);
+
+    const connection =
+        await db.getConnection();
+
+    try {
+
+        await connection.beginTransaction();
+
+        // Update lifecycle status
+        await updateAuctionStatus(
+            connection,
+            bid
+        );
+
+        // Finalize only if auction has ended
+        await finalizeAuction(
+            connection,
+            bid
+        );
+
+        await connection.commit();
+
+    } catch (error) {
+
+        await connection.rollback();
+
+        console.error(
+            `Auction ${auctionId} finalization error:`,
+            error
+        );
+
+        // IMPORTANT:
+        // Do not crash the entire /my-bids
+        // request because one auction failed.
+        //
+        // The user's other bids should still
+        // be returned.
+        continue;
+
+    } finally {
+
+        connection.release();
+    }
+}
 
         // Format each bid record according to the auction lifecycle.
         const formattedBids = bids.map(formatAuctionResponse);
@@ -268,6 +753,7 @@ router.get("/my-results", authenticateToken, async (req, res) => {
                 a.status,
                 a.high_bidder,
                 a.high_bidder_id,
+                a.settlement_status,
 
                 v.title AS vehicle_title,
                 v.make,
@@ -302,6 +788,7 @@ router.get("/my-results", authenticateToken, async (req, res) => {
                 a.status,
                 a.high_bidder,
                 a.high_bidder_id,
+                a.settlement_status,
                 v.title,
                 v.make,
                 v.model,
@@ -334,7 +821,8 @@ router.get("/my-results", authenticateToken, async (req, res) => {
                 reserve_price: auction.reserve_price,
                 reserve_met: auction.reserve_met,
                 bid_count: auction.bid_count,
-                status: auction.status
+                status: auction.status,
+                settlement_status: auction.settlement_status
             },
 
             my_highest_bid: auction.my_highest_bid,
@@ -361,14 +849,61 @@ res.status(200).json({
         });
     }
 });
-// GET MY AUCTIONS (seller)
+// =====================================================
+// GET MY AUCTIONS (SELLER)
+// =====================================================
+
 router.get("/my-auctions", authenticateToken, async (req, res) => {
     try {
-        const sellerId = req.user.userId;
+        const sellerId = Number(req.user.userId);
+
+        // -------------------------------------------------
+        // 1. Validate authenticated user
+        // -------------------------------------------------
+
+        if (!Number.isInteger(sellerId) || sellerId <= 0) {
+            return res.status(401).json({
+                success: false,
+                message: "Invalid authenticated user"
+            });
+        }
+
+        // -------------------------------------------------
+        // 2. Get seller's auctions
+        // -------------------------------------------------
 
         const [auctions] = await db.query(
-            `SELECT
-                a.*,
+            `
+            SELECT
+                a.id,
+                a.vehicle_id,
+
+                a.start_time,
+                a.end_time,
+                a.scheduled_end_time,
+                a.current_end_time,
+
+                a.extension_seconds,
+                a.max_extension_seconds,
+
+                a.starting_bid,
+                a.current_bid,
+                a.reserve_price,
+                a.reserve_met,
+
+                a.bid_count,
+                a.status,
+
+                a.high_bidder,
+                a.high_bidder_id,
+
+                a.created_at,
+                a.updated_at,
+
+                a.settlement_status,
+                a.settled_at,
+                a.settlement_reference,
+
                 v.title AS vehicle_title,
                 v.make,
                 v.model,
@@ -376,33 +911,97 @@ router.get("/my-auctions", authenticateToken, async (req, res) => {
                 v.category,
                 v.primary_damage,
                 v.secondary_damage,
+                v.current_bid AS vehicle_current_bid,
                 v.seller_id
-             FROM auctions a
-             INNER JOIN vehicles v
+
+            FROM auctions a
+
+            INNER JOIN vehicles v
                 ON a.vehicle_id = v.id
-             WHERE v.seller_id = ?
-             ORDER BY a.start_time DESC`,
+
+            WHERE v.seller_id = ?
+
+            ORDER BY a.start_time DESC
+            `,
             [sellerId]
         );
 
-        // Update auction status according to its time
+        // -------------------------------------------------
+        // 3. Update DISPLAY status only
+        //
+        // IMPORTANT:
+        // This does NOT perform settlement.
+        // -------------------------------------------------
+
+        const now = new Date();
+
         for (const auction of auctions) {
-            await updateAuctionStatus(db, auction);
+
+            const startTime = new Date(auction.start_time);
+
+            const endTime = new Date(
+                auction.current_end_time ||
+                auction.end_time
+            );
+
+            // ---------------------------------------------
+            // Safety check for invalid database dates
+            // ---------------------------------------------
+
+            if (
+                Number.isNaN(startTime.getTime()) ||
+                Number.isNaN(endTime.getTime())
+            ) {
+                console.error(
+                    `Invalid auction dates for auction ${auction.id}`
+                );
+
+                continue;
+            }
+
+            // ---------------------------------------------
+            // Calculate current lifecycle state
+            // ---------------------------------------------
+
+            if (now < startTime) {
+
+                auction.status = "upcoming";
+
+            } else if (now < endTime) {
+
+                auction.status = "active";
+
+            } else {
+
+                auction.status = "ended";
+            }
         }
 
-        // Format auction data according to its lifecycle state
-        const formattedAuctions = auctions.map(formatAuctionResponse);
+        // -------------------------------------------------
+        // 4. Format response
+        // -------------------------------------------------
 
-        res.status(200).json({
+        const formattedAuctions =
+            auctions.map(formatAuctionResponse);
+
+        // -------------------------------------------------
+        // 5. Send response
+        // -------------------------------------------------
+
+        return res.status(200).json({
             success: true,
             count: formattedAuctions.length,
             auctions: formattedAuctions
         });
 
     } catch (error) {
-        console.error("Get my auctions error:", error);
 
-        res.status(500).json({
+        console.error(
+            "Get my auctions error:",
+            error
+        );
+
+        return res.status(500).json({
             success: false,
             message: "Failed to fetch your auctions"
         });
@@ -442,12 +1041,35 @@ router.get("/my-auctions/:auctionId", authenticateToken, async (req, res) => {
 
         const auction = auctions[0];
 
-        // Update auction status according to its time
-        await updateAuctionStatus(db, auction);
+let finalization;
 
-        // Finalize auction if its end time has passed
-        const finalization = await finalizeAuction(db, auction);
+const connection = await db.getConnection();
 
+try {
+
+    await connection.beginTransaction();
+
+    // Update auction status according to its time
+    await updateAuctionStatus(connection, auction);
+
+    // Finalize auction if its end time has passed
+    finalization = await finalizeAuction(
+        connection,
+        auction
+    );
+
+    await connection.commit();
+
+} catch (error) {
+
+    await connection.rollback();
+
+    throw error;
+
+} finally {
+
+    connection.release();
+}
         // Get bid history
         const [bids] = await db.query(
             `SELECT
@@ -597,14 +1219,41 @@ router.get("/:auctionId", async (req, res) => {
             });
         }
 
-      const auction = auctions[0];
+     const auction = auctions[0];
 
-await updateAuctionStatus(db, auction);
+let finalization;
 
-const finalization = await finalizeAuction(db, auction);
+const connection = await db.getConnection();
 
-const formattedAuction = formatAuctionResponse(auction);
+try {
 
+    await connection.beginTransaction();
+
+    await updateAuctionStatus(
+        connection,
+        auction
+    );
+
+    finalization = await finalizeAuction(
+        connection,
+        auction
+    );
+
+    await connection.commit();
+
+} catch (error) {
+
+    await connection.rollback();
+
+    throw error;
+
+} finally {
+
+    connection.release();
+}
+
+const formattedAuction =
+    formatAuctionResponse(auction); 
 res.status(200).json({
     success: true,
     auction: formattedAuction,
@@ -897,7 +1546,8 @@ router.post("/:auctionId/bids", authenticateToken, async (req, res) => {
         const [auctions] = await connection.query(
             `SELECT
                 a.*,
-                v.seller_id
+                v.seller_id,
+                v.sale_status
              FROM auctions a
              INNER JOIN vehicles v
                  ON a.vehicle_id = v.id
@@ -915,7 +1565,34 @@ router.post("/:auctionId/bids", authenticateToken, async (req, res) => {
             });
         }
 
-        const auction = auctions[0];
+ const auction = auctions[0];
+
+// Vehicle must still be available for bidding
+if (auction.sale_status === "sold") {
+    await connection.rollback();
+
+    return res.status(409).json({
+        success: false,
+        message: "This vehicle has already been sold"
+    });
+}
+
+// Auction has already reached a final settlement state
+if (
+    auction.settlement_status === "completed" ||
+    auction.settlement_status === "no_winner" ||
+    auction.settlement_status === "payment_expired"
+) {
+    await connection.rollback();
+
+    return res.status(409).json({
+        success: false,
+        message: "This auction is no longer available for bidding"
+    });
+}
+
+// 3. Automatically update auction status
+await updateAuctionStatus(connection, auction);
 
         // 3. Automatically update auction status
         await updateAuctionStatus(connection, auction);
@@ -1185,6 +1862,580 @@ router.post("/:auctionId/bids", authenticateToken, async (req, res) => {
         }
     }
 });
+// =====================================================
+// PAY FOR WON AUCTION
+// POST /api/auctions/:auctionId/pay
+// =====================================================
 
+router.post(
+    "/:auctionId/pay",
+    authenticateToken,
+    async (req, res) => {
 
+        let connection;
+
+        try {
+
+            const auctionId =
+                Number(req.params.auctionId);
+
+            const bidderId =
+                Number(req.user.userId);
+
+            if (!Number.isInteger(auctionId)) {
+
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid auction ID"
+                });
+            }
+
+            connection =
+                await db.getConnection();
+
+            await connection.beginTransaction();
+
+            // -------------------------------------------------
+            // 1. LOCK AUCTION
+            // -------------------------------------------------
+
+            const [auctions] =
+                await connection.query(
+                    `SELECT
+                        a.*,
+                        v.seller_id
+                     FROM auctions a
+                     INNER JOIN vehicles v
+                        ON a.vehicle_id = v.id
+                     WHERE a.id = ?
+                     FOR UPDATE`,
+                    [auctionId]
+                );
+
+            if (auctions.length === 0) {
+
+                await connection.rollback();
+
+                return res.status(404).json({
+                    success: false,
+                    message: "Auction not found"
+                });
+            }
+
+            const auction =
+                auctions[0];
+
+            // -------------------------------------------------
+            // 2. CHECK AUCTION STATUS
+            // -------------------------------------------------
+
+            if (auction.status !== "ended") {
+
+                await connection.rollback();
+
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        "This auction has not ended yet"
+                });
+            }
+
+            // -------------------------------------------------
+            // 3. CHECK SETTLEMENT STATUS
+            // -------------------------------------------------
+
+            if (
+                auction.settlement_status ===
+                "completed"
+            ) {
+
+                await connection.rollback();
+
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        "This auction has already been paid"
+                });
+            }
+
+            // -------------------------------------------------
+            // 4. CHECK WINNER
+            // -------------------------------------------------
+
+            if (
+                Number(auction.high_bidder_id) !==
+                bidderId
+            ) {
+
+                await connection.rollback();
+
+                return res.status(403).json({
+                    success: false,
+                    message:
+                        "You are not the winner of this auction"
+                });
+            }
+
+            // -------------------------------------------------
+            // 5. CHECK RESERVE
+            // -------------------------------------------------
+
+            if (
+                Number(auction.reserve_met) !==
+                1
+            ) {
+
+                await connection.rollback();
+
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        "Reserve price was not met"
+                });
+            }
+
+            // -------------------------------------------------
+            // 6. VALIDATE FINAL PRICE
+            // -------------------------------------------------
+
+            const finalPrice =
+                Number(auction.current_bid);
+
+            if (
+                !Number.isFinite(finalPrice) ||
+                finalPrice <= 0
+            ) {
+
+                await connection.rollback();
+
+                return res.status(500).json({
+                    success: false,
+                    message:
+                        "Invalid auction final price"
+                });
+            }
+
+            // -------------------------------------------------
+            // 7. CHECK PAYMENT DEADLINE
+            // -------------------------------------------------
+
+            if (auction.payment_deadline) {
+
+                const paymentDeadline =
+                    new Date(
+                        auction.payment_deadline
+                    );
+
+                if (
+                    Number.isNaN(
+                        paymentDeadline.getTime()
+                    )
+                ) {
+
+                    await connection.rollback();
+
+                    return res.status(500).json({
+                        success: false,
+                        message:
+                            "Invalid payment deadline"
+                    });
+                }
+
+                if (
+                    new Date() >
+                    paymentDeadline
+                ) {
+
+                    await connection.rollback();
+
+                    return res.status(410).json({
+                        success: false,
+                        message:
+                            "Payment deadline has expired"
+                    });
+                }
+            }
+
+            // -------------------------------------------------
+            // 8. CHECK EXISTING PURCHASE
+            // -------------------------------------------------
+
+            const [existingPurchases] =
+                await connection.query(
+                    `SELECT
+                        id,
+                        buyer_id,
+                        purchase_price,
+                        status
+                     FROM vehicle_purchases
+                     WHERE vehicle_id = ?
+                     LIMIT 1
+                     FOR UPDATE`,
+                    [auction.vehicle_id]
+                );
+
+            if (
+                existingPurchases.length > 0
+            ) {
+
+                const purchase =
+                    existingPurchases[0];
+
+                if (
+                    Number(purchase.buyer_id) ===
+                    bidderId
+                ) {
+
+                    await connection.query(
+                        `UPDATE auctions
+                         SET
+                            settlement_status =
+                                'completed',
+                            settled_at =
+                                COALESCE(
+                                    settled_at,
+                                    NOW()
+                                ),
+                            settlement_reference =
+                                COALESCE(
+                                    settlement_reference,
+                                    ?
+                                )
+                         WHERE id = ?`,
+                        [
+                            `SETTLEMENT-${auction.id}`,
+                            auction.id
+                        ]
+                    );
+
+                    await connection.commit();
+
+                    return res.status(200).json({
+                        success: true,
+                        message:
+                            "Auction payment was already completed",
+                        auction_id:
+                            auction.id,
+                        purchase_id:
+                            purchase.id
+                    });
+                }
+
+                await connection.rollback();
+
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        "This vehicle has already been purchased"
+                });
+            }
+
+            // -------------------------------------------------
+            // 9. LOCK BUYER + SELLER
+            // -------------------------------------------------
+
+            const sellerId =
+                Number(auction.seller_id);
+
+            if (
+                !Number.isInteger(sellerId)
+            ) {
+
+                throw new Error(
+                    "Invalid seller ID"
+                );
+            }
+
+            const [users] =
+                await connection.query(
+                    `SELECT
+                        id,
+                        wallet_balance
+                     FROM users
+                     WHERE id IN (?, ?)
+                     ORDER BY id
+                     FOR UPDATE`,
+                    [
+                        bidderId,
+                        sellerId
+                    ]
+                );
+
+            const buyer =
+                users.find(
+                    user =>
+                        Number(user.id) ===
+                        bidderId
+                );
+
+            const seller =
+                users.find(
+                    user =>
+                        Number(user.id) ===
+                        sellerId
+                );
+
+            if (!buyer) {
+
+                throw new Error(
+                    "Buyer account not found"
+                );
+            }
+
+            if (!seller) {
+
+                throw new Error(
+                    "Seller account not found"
+                );
+            }
+
+            // -------------------------------------------------
+            // 10. CHECK BUYER BALANCE
+            // -------------------------------------------------
+
+            const buyerBalance =
+                Number(
+                    buyer.wallet_balance
+                );
+
+            if (
+                !Number.isFinite(
+                    buyerBalance
+                ) ||
+                buyerBalance < finalPrice
+            ) {
+
+                await connection.rollback();
+
+                return res.status(402).json({
+                    success: false,
+                    message:
+                        "Insufficient wallet balance",
+                    required_amount:
+                        finalPrice,
+                    wallet_balance:
+                        buyerBalance,
+                    payment_required:
+                        true
+                });
+            }
+
+            // -------------------------------------------------
+            // 11. CREATE SETTLEMENT REFERENCE
+            // -------------------------------------------------
+
+            const settlementReference =
+                `SETTLEMENT-${auction.id}`;
+
+            // -------------------------------------------------
+            // 12. MARK PROCESSING
+            // -------------------------------------------------
+
+            await connection.query(
+                `UPDATE auctions
+                 SET settlement_status =
+                     'processing'
+                 WHERE id = ?
+                   AND settlement_status IN
+                       ('pending', 'processing')`,
+                [auction.id]
+            );
+
+            // -------------------------------------------------
+            // 13. DEBIT BUYER
+            // -------------------------------------------------
+
+            const [debitResult] =
+                await connection.query(
+                    `UPDATE users
+                     SET wallet_balance =
+                         wallet_balance - ?
+                     WHERE id = ?
+                       AND wallet_balance >= ?`,
+                    [
+                        finalPrice,
+                        bidderId,
+                        finalPrice
+                    ]
+                );
+
+            if (
+                debitResult.affectedRows !== 1
+            ) {
+
+                throw new Error(
+                    "Buyer wallet debit failed"
+                );
+            }
+
+            // -------------------------------------------------
+            // 14. BUYER TRANSACTION
+            // -------------------------------------------------
+
+            await connection.query(
+                `INSERT INTO wallet_transactions
+                (
+                    user_id,
+                    type,
+                    amount,
+                    description,
+                    reference_id
+                )
+                VALUES (?, 'debit', ?, ?, ?)`,
+                [
+                    bidderId,
+                    finalPrice,
+                    `Payment for vehicle ${auction.vehicle_id}`,
+                    settlementReference
+                ]
+            );
+
+            // -------------------------------------------------
+            // 15. CREDIT SELLER
+            // -------------------------------------------------
+
+            await connection.query(
+                `UPDATE users
+                 SET wallet_balance =
+                     wallet_balance + ?
+                 WHERE id = ?`,
+                [
+                    finalPrice,
+                    sellerId
+                ]
+            );
+
+            // -------------------------------------------------
+            // 16. SELLER TRANSACTION
+            // -------------------------------------------------
+
+            await connection.query(
+                `INSERT INTO wallet_transactions
+                (
+                    user_id,
+                    type,
+                    amount,
+                    description,
+                    reference_id
+                )
+                VALUES (?, 'credit', ?, ?, ?)`,
+                [
+                    sellerId,
+                    finalPrice,
+                    `Payment received for vehicle ${auction.vehicle_id}`,
+                    settlementReference
+                ]
+            );
+
+            // -------------------------------------------------
+            // 17. CREATE PURCHASE
+            // -------------------------------------------------
+
+            const [purchaseResult] =
+                await connection.query(
+                    `INSERT INTO vehicle_purchases
+                    (
+                        vehicle_id,
+                        buyer_id,
+                        purchase_price,
+                        status
+                    )
+                    VALUES (?, ?, ?, 'completed')`,
+                    [
+                        auction.vehicle_id,
+                        bidderId,
+                        finalPrice
+                    ]
+                );
+
+            // -------------------------------------------------
+            // 18. COMPLETE AUCTION
+            // -------------------------------------------------
+
+            await connection.query(
+                `UPDATE auctions
+                 SET
+                    settlement_status =
+                        'completed',
+                    settled_at =
+                        NOW(),
+                    settlement_reference = ?
+                 WHERE id = ?`,
+                [
+                    settlementReference,
+                    auction.id
+                ]
+            );
+
+            // -------------------------------------------------
+            // 19. COMMIT EVERYTHING
+            // -------------------------------------------------
+
+            await connection.commit();
+
+            // -------------------------------------------------
+            // 20. SUCCESS RESPONSE
+            // -------------------------------------------------
+
+            return res.status(200).json({
+                success: true,
+
+                message:
+                    "Auction payment completed successfully",
+
+                auction_id:
+                    auction.id,
+
+                vehicle_id:
+                    auction.vehicle_id,
+
+                purchase_id:
+                    purchaseResult.insertId,
+
+                payment: {
+                    amount:
+                        finalPrice,
+
+                    status:
+                        "completed",
+
+                    reference:
+                        settlementReference
+                }
+            });
+
+        } catch (error) {
+
+            if (connection) {
+
+                try {
+                    await connection.rollback();
+                } catch (rollbackError) {
+
+                    console.error(
+                        "Payment rollback error:",
+                        rollbackError
+                    );
+                }
+            }
+
+            console.error(
+                "Auction payment error:",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    "Failed to complete auction payment"
+            });
+
+        } finally {
+
+            if (connection) {
+                connection.release();
+            }
+        }
+    }
+);
 module.exports = router;
