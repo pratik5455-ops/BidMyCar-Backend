@@ -5,7 +5,6 @@ const authenticateToken = require("../middleware/authMiddleware");
 
 const router = express.Router();
 
-
 // ======================================================
 // GET ALL VEHICLES
 // GET /api/vehicles
@@ -236,9 +235,13 @@ router.post("/:id/buy", authenticateToken, async (req, res) => {
     try {
 
         const vehicleId = req.params.id;
-        const buyerId = req.user.userId;
+        const buyerId = Number(req.user.userId);
 
         await connection.beginTransaction();
+
+        // -------------------------------------------------
+        // 1. LOCK VEHICLE
+        // -------------------------------------------------
 
         const [vehicles] = await connection.query(
             `SELECT *
@@ -249,7 +252,9 @@ router.post("/:id/buy", authenticateToken, async (req, res) => {
         );
 
         if (vehicles.length === 0) {
+
             await connection.rollback();
+
             return res.status(404).json({
                 success: false,
                 message: "Vehicle not found"
@@ -258,83 +263,134 @@ router.post("/:id/buy", authenticateToken, async (req, res) => {
 
         const vehicle = vehicles[0];
 
-        // Seller protection
-        if (Number(vehicle.seller_id) === Number(buyerId)) {
+        // -------------------------------------------------
+        // 2. SELLER PROTECTION
+        // -------------------------------------------------
+
+        const sellerId = Number(vehicle.seller_id);
+
+        if (sellerId === buyerId) {
+
             await connection.rollback();
+
             return res.status(403).json({
                 success: false,
                 message: "You cannot buy your own vehicle"
             });
         }
 
-        const buyNowPrice = Number(vehicle.buy_it_now_price);
+        // -------------------------------------------------
+        // 3. VEHICLE ALREADY SOLD CHECK
+        // -------------------------------------------------
+
+        if (vehicle.sale_status === "sold") {
+
+            await connection.rollback();
+
+            return res.status(409).json({
+                success: false,
+                message: "This vehicle has already been sold"
+            });
+        }
+
+        // -------------------------------------------------
+        // 4. CHECK BUY IT NOW PRICE
+        // -------------------------------------------------
+
+        const buyNowPrice =
+            Number(vehicle.buy_it_now_price);
 
         if (
             vehicle.buy_it_now_price === null ||
             !Number.isFinite(buyNowPrice) ||
             buyNowPrice <= 0
         ) {
+
             await connection.rollback();
+
             return res.status(400).json({
                 success: false,
-                message: "Buy It Now is not available for this vehicle"
+                message:
+                    "Buy It Now is not available for this vehicle"
             });
         }
 
-        // Check whether vehicle is already purchased
-        const [existingPurchases] = await connection.query(
-            `SELECT id
-             FROM vehicle_purchases
-             WHERE vehicle_id = ?
-             LIMIT 1
-             FOR UPDATE`,
-            [vehicleId]
-        );
+        // -------------------------------------------------
+        // 5. CHECK EXISTING PURCHASE
+        // -------------------------------------------------
+
+        const [existingPurchases] =
+            await connection.query(
+                `SELECT id
+                 FROM vehicle_purchases
+                 WHERE vehicle_id = ?
+                 LIMIT 1
+                 FOR UPDATE`,
+                [vehicleId]
+            );
 
         if (existingPurchases.length > 0) {
+
             await connection.rollback();
+
             return res.status(409).json({
                 success: false,
-                message: "This vehicle has already been purchased"
+                message:
+                    "This vehicle has already been purchased"
             });
         }
 
-        // Check auction
-        const [auctions] = await connection.query(
-            `SELECT
-                id,
-                status,
-                reserve_met,
-                high_bidder_id
-             FROM auctions
-             WHERE vehicle_id = ?
-             LIMIT 1
-             FOR UPDATE`,
-            [vehicleId]
-        );
+        // -------------------------------------------------
+        // 6. CHECK AUCTION
+        // -------------------------------------------------
+
+        const [auctions] =
+            await connection.query(
+                `SELECT
+                    id,
+                    status,
+                    reserve_met,
+                    high_bidder_id
+                 FROM auctions
+                 WHERE vehicle_id = ?
+                 ORDER BY id DESC
+                 LIMIT 1
+                 FOR UPDATE`,
+                [vehicleId]
+            );
 
         if (auctions.length > 0) {
 
             const auction = auctions[0];
 
+            // ---------------------------------------------
             // Auction already produced a winner
+            // ---------------------------------------------
+
             if (
                 auction.status === "ended" &&
                 Number(auction.reserve_met) === 1 &&
                 auction.high_bidder_id !== null
             ) {
+
                 await connection.rollback();
+
                 return res.status(409).json({
                     success: false,
-                    message: "This vehicle has already been won through auction"
+                    message:
+                        "This vehicle has already been won through auction"
                 });
             }
 
+            // ---------------------------------------------
             // Stop active/upcoming auction
+            // ---------------------------------------------
+
             if (
                 auction.status === "active" ||
                 auction.status === "upcoming"
             ) {
+
                 await connection.query(
                     `UPDATE auctions
                      SET
@@ -346,33 +402,254 @@ router.post("/:id/buy", authenticateToken, async (req, res) => {
             }
         }
 
-        // Create purchase
-        const [purchaseResult] = await connection.query(
-            `INSERT INTO vehicle_purchases (
-                vehicle_id,
-                buyer_id,
-                purchase_price,
-                status
+        // -------------------------------------------------
+        // 7. LOCK BUYER + SELLER
+        // -------------------------------------------------
+
+        const [users] =
+            await connection.query(
+                `SELECT
+                    id,
+                    name,
+                    wallet_balance
+                 FROM users
+                 WHERE id IN (?, ?)
+                 ORDER BY id
+                 FOR UPDATE`,
+                [
+                    buyerId,
+                    sellerId
+                ]
+            );
+
+        const buyer =
+            users.find(
+                user =>
+                    Number(user.id) === buyerId
+            );
+
+        const seller =
+            users.find(
+                user =>
+                    Number(user.id) === sellerId
+            );
+
+        if (!buyer) {
+            throw new Error(
+                "Buyer account not found"
+            );
+        }
+
+        if (!seller) {
+            throw new Error(
+                "Seller account not found"
+            );
+        }
+
+        // -------------------------------------------------
+        // 8. CHECK BUYER WALLET BALANCE
+        // -------------------------------------------------
+
+        const buyerBalance =
+            Number(buyer.wallet_balance);
+
+        if (
+            !Number.isFinite(buyerBalance) ||
+            buyerBalance < buyNowPrice
+        ) {
+
+            await connection.rollback();
+
+            return res.status(402).json({
+                success: false,
+                message:
+                    "Insufficient wallet balance",
+                required_amount:
+                    buyNowPrice,
+                wallet_balance:
+                    buyerBalance,
+                payment_required:
+                    true
+            });
+        }
+
+        // -------------------------------------------------
+        // 9. CREATE PAYMENT REFERENCE
+        // -------------------------------------------------
+
+        const paymentReference =
+            `BUY-NOW-${vehicleId}-${Date.now()}`;
+
+        // -------------------------------------------------
+        // 10. DEBIT BUYER
+        // -------------------------------------------------
+
+        const [buyerDebitResult] =
+            await connection.query(
+                `UPDATE users
+                 SET
+                    wallet_balance =
+                        wallet_balance - ?
+                 WHERE id = ?
+                   AND wallet_balance >= ?`,
+                [
+                    buyNowPrice,
+                    buyerId,
+                    buyNowPrice
+                ]
+            );
+
+        if (
+            buyerDebitResult.affectedRows !== 1
+        ) {
+
+            throw new Error(
+                "Buyer wallet debit failed"
+            );
+        }
+
+        // -------------------------------------------------
+        // 11. BUYER WALLET TRANSACTION
+        // -------------------------------------------------
+
+        await connection.query(
+            `INSERT INTO wallet_transactions
+            (
+                user_id,
+                type,
+                amount,
+                description,
+                reference_id
             )
-            VALUES (?, ?, ?, 'completed')`,
+            VALUES (?, 'debit', ?, ?, ?)`,
             [
-                vehicleId,
                 buyerId,
-                buyNowPrice
+                buyNowPrice,
+                `Buy It Now payment for vehicle ${vehicleId}`,
+                paymentReference
             ]
         );
 
+        // -------------------------------------------------
+        // 12. CREDIT SELLER
+        // -------------------------------------------------
+
+        await connection.query(
+            `UPDATE users
+             SET
+                wallet_balance =
+                    wallet_balance + ?
+             WHERE id = ?`,
+            [
+                buyNowPrice,
+                sellerId
+            ]
+        );
+
+        // -------------------------------------------------
+        // 13. SELLER WALLET TRANSACTION
+        // -------------------------------------------------
+
+        await connection.query(
+            `INSERT INTO wallet_transactions
+            (
+                user_id,
+                type,
+                amount,
+                description,
+                reference_id
+            )
+            VALUES (?, 'credit', ?, ?, ?)`,
+            [
+                sellerId,
+                buyNowPrice,
+                `Payment received for vehicle ${vehicleId}`,
+                paymentReference
+            ]
+        );
+
+        // -------------------------------------------------
+        // 14. CREATE VEHICLE PURCHASE
+        // -------------------------------------------------
+
+        const [purchaseResult] =
+            await connection.query(
+                `INSERT INTO vehicle_purchases
+                (
+                    vehicle_id,
+                    buyer_id,
+                    purchase_price,
+                    status
+                )
+                VALUES (?, ?, ?, 'completed')`,
+                [
+                    vehicleId,
+                    buyerId,
+                    buyNowPrice
+                ]
+            );
+
+        // -------------------------------------------------
+        // 15. MARK VEHICLE AS SOLD
+        // -------------------------------------------------
+
+        const [vehicleUpdateResult] =
+            await connection.query(
+                `UPDATE vehicles
+                 SET
+                    sale_status = 'sold',
+                    sold_at = NOW(),
+                    sold_to = ?
+                 WHERE id = ?
+                   AND sale_status <> 'sold'`,
+                [
+                    buyerId,
+                    vehicleId
+                ]
+            );
+
+        if (
+            vehicleUpdateResult.affectedRows !== 1
+        ) {
+
+            throw new Error(
+                `Vehicle sale-state update failed for ${vehicleId}`
+            );
+        }
+
+        // -------------------------------------------------
+        // 16. COMMIT EVERYTHING
+        // -------------------------------------------------
+
         await connection.commit();
 
-        res.status(201).json({
+        // -------------------------------------------------
+        // 17. SUCCESS RESPONSE
+        // -------------------------------------------------
+
+        return res.status(201).json({
             success: true,
-            message: "Vehicle purchased successfully",
+            message:
+                "Vehicle purchased successfully",
             purchase: {
-                id: purchaseResult.insertId,
-                vehicle_id: vehicleId,
-                buyer_id: buyerId,
-                purchase_price: buyNowPrice,
-                status: "completed"
+                id:
+                    purchaseResult.insertId,
+                vehicle_id:
+                    vehicleId,
+                buyer_id:
+                    buyerId,
+                purchase_price:
+                    buyNowPrice,
+                status:
+                    "completed"
+            },
+            payment: {
+                amount:
+                    buyNowPrice,
+                status:
+                    "completed",
+                reference:
+                    paymentReference
             }
         });
 
@@ -381,21 +658,33 @@ router.post("/:id/buy", authenticateToken, async (req, res) => {
         try {
             await connection.rollback();
         } catch (rollbackError) {
-            console.error("Rollback error:", rollbackError);
+
+            console.error(
+                "Rollback error:",
+                rollbackError
+            );
         }
 
-        if (error.code === "ER_DUP_ENTRY") {
+        if (
+            error.code === "ER_DUP_ENTRY"
+        ) {
+
             return res.status(409).json({
                 success: false,
-                message: "This vehicle has already been purchased"
+                message:
+                    "This vehicle has already been purchased"
             });
         }
 
-        console.error("Buy It Now error:", error);
+        console.error(
+            "Buy It Now error:",
+            error
+        );
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
-            message: "Failed to complete vehicle purchase"
+            message:
+                "Failed to complete vehicle purchase"
         });
 
     } finally {

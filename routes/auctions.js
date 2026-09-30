@@ -2347,9 +2347,32 @@ router.post(
                         finalPrice
                     ]
                 );
-
             // -------------------------------------------------
-            // 18. COMPLETE AUCTION
+           // 18. MARK VEHICLE AS SOLD
+          // -------------------------------------------------
+
+          const [vehicleUpdateResult] =
+          await connection.query(
+          `UPDATE vehicles
+         SET
+             sale_status = 'sold',
+             sold_at = NOW(),
+             sold_to = ?
+         WHERE id = ?
+           AND sale_status <> 'sold'`,
+        [
+            bidderId,
+            auction.vehicle_id
+        ]
+    );
+
+        if (vehicleUpdateResult.affectedRows !== 1) {
+    throw new Error(
+        `Vehicle sale-state update failed for ${auction.vehicle_id}`
+    );
+     }
+            // -------------------------------------------------
+            // 19. COMPLETE AUCTION
             // -------------------------------------------------
 
             await connection.query(
@@ -2368,14 +2391,14 @@ router.post(
             );
 
             // -------------------------------------------------
-            // 19. COMMIT EVERYTHING
+            // 20. COMMIT TRANSACTION
             // -------------------------------------------------
 
             await connection.commit();
 
             // -------------------------------------------------
-            // 20. SUCCESS RESPONSE
-            // -------------------------------------------------
+           // 21.Success RESPONSE
+          // -------------------------------------------------
 
             return res.status(200).json({
                 success: true,
